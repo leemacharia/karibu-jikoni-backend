@@ -2,10 +2,16 @@
 
 namespace App\Http\Controllers;
 
+use Illuminate\Support\Facades\Password;
 use App\Models\User;
+use App\Models\Role;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Hash;
-use Illuminate\Validation\ValidationException;
+use Illuminate\Support\Facades\Mail;
+use App\Mail\VerifyEmail;
+use App\Mail\ResetPassword;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\Auth;
 
 class AuthController extends Controller
 {
@@ -13,73 +19,102 @@ class AuthController extends Controller
     {
         $request->validate([
             'name' => 'required|string|max:255',
-            'email' => 'required|string|email|unique:users',
-            'password' => 'required|string|min:8|confirmed',
-            'admin_passkey' => 'nullable|string',
+            'email' => 'required|email|unique:users,email',
+            'password' => 'required|string|min:6|confirmed',
         ]);
 
-        $isAdmin = $request->admin_passkey === 'ADMIN_PASSKEY_2025';
+        $superAdminEmail = env('SUPER_ADMIN_EMAIL', 'superadmin@karibujikoni.com');
+        $isSuperAdmin = $request->email === $superAdminEmail && !Cache::has('super_admin_created');
 
+        if ($isSuperAdmin) {
+            Cache::forever('super_admin_created', true);
+        }
+
+        $role = Role::where('name', $isSuperAdmin ? 'super_admin' : 'user')->firstOrFail();
         $user = User::create([
             'name' => $request->name,
             'email' => $request->email,
             'password' => Hash::make($request->password),
-            'is_admin' => $isAdmin,
+            'role_id' => $role->id,
         ]);
 
-        $token = $user->createToken('auth-token')->plainTextToken;
+        $code = rand(100000, 999999);
+        $user->email_verification_code = $code;
+        $user->save();
 
-        return response()->json([
-            'message' => 'Registration successful',
-            'user' => $user,
-            'token' => $token,
-        ], 201);
+        $user->preference()->create([
+            'dietary_preference' => 'none',
+            'delivery_frequency' => 'weekly',
+        ]);
+
+        Mail::to($user->email)->send(new VerifyEmail($user));
+        $token = $user->createToken('auth_token')->plainTextToken;
+        return response()->json(['user' => $user, 'token' => $token]);
     }
 
     public function login(Request $request)
     {
-        $request->validate([
-            'email' => 'required|email',
-            'password' => 'required|string',
-        ]);
-
-        $user = User::where('email', $request->email)->first();
-
-        if (!$user || !Hash::check($request->password, $user->password)) {
-            throw ValidationException::withMessages([
-                'email' => ['The provided credentials are incorrect.'],
-            ]);
+        $request->validate(['email' => 'required|email', 'password' => 'required']);
+        if (Auth::attempt($request->only('email', 'password'))) {
+            $user = Auth::user();
+            $token = $user->createToken('auth_token')->plainTextToken;
+            return response()->json(['user' => $user, 'token' => $token]);
         }
-
-        $token = $user->createToken('auth-token')->plainTextToken;
-
-        return response()->json([
-            'message' => 'Login successful',
-            'user' => $user,
-            'token' => $token,
-        ]);
+        return response()->json(['message' => 'Invalid credentials'], 401);
     }
-    public function update(Request $request)
-{
-    $user = $request->user();
-    $request->validate([
-        'name' => 'required|string|max:255',
-        'phone' => 'nullable|string',
-    ]);
 
-    $user->update([
-        'name' => $request->name,
-        'phone' => $request->phone,
-    ]);
-
-    return response()->json(['message' => 'Profile updated successfully', 'user' => $user]);
-}
-
-    public function logout(Request $request)
+    public function logout()
     {
-        $request->user()->currentAccessToken()->delete();
-
-        return response()->json(['message' => 'Logged out successfully']);
+        Auth::user()->tokens()->delete();
+        return response()->json(['message' => 'Logged out']);
     }
 
+    public function verifyEmail(Request $request)
+    {
+        $request->validate(['code' => 'required|string']);
+        $user = Auth::user();
+        if ($user && $user->email_verification_code === $request->code) {
+            $user->email_verified_at = now();
+            $user->email_verification_code = null;
+            $user->save();
+            return response()->json(['message' => 'Email verified']);
+        }
+        return response()->json(['message' => 'Invalid code'], 400);
+    }
+
+    public function sendResetCode(Request $request)
+    {
+        $request->validate(['email' => 'required|email']);
+        $user = User::where('email', $request->email)->first();
+        if ($user) {
+            $code = rand(100000, 999999);
+            $user->email_verification_code = $code;
+            $user->save();
+            Mail::to($user->email)->send(new ResetPassword($user));
+        }
+        return response()->json(['message' => 'Reset code sent']);
+    }
+
+    public function resetPassword(Request $request)
+    {
+        $request->validate(['email' => 'required|email', 'code' => 'required|string', 'password' => 'required|string|min:6']);
+        $user = User::where('email', $request->email)->first();
+        if ($user && $user->email_verification_code === $request->code) {
+            $user->password = Hash::make($request->password);
+            $user->email_verification_code = null;
+            $user->save();
+            return response()->json(['message' => 'Password reset']);
+        }
+        return response()->json(['message' => 'Invalid code'], 400);
+    }
+
+    public function showLoginForm()
+    {
+        return view('auth.login');
+    }
+
+    public function showForgotPasswordForm()
+    {
+        return view('auth.forgot-password');
+    }
 }
